@@ -1,122 +1,455 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'game.dart';
+import 'ai.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const ReversiApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class ReversiApp extends StatelessWidget {
+  const ReversiApp({Key? key}) : super(key: key);
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'Reversi 奧賽羅黑白棋',
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: const ReversiPage(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class ReversiPage extends StatefulWidget {
+  const ReversiPage({Key? key}) : super(key: key);
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<ReversiPage> createState() => _ReversiPageState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+/// Intent used for undo keyboard shortcut (Ctrl+Z)
+class UndoIntent extends Intent {
+  const UndoIntent();
+}
 
-  void _incrementCounter() {
+class _ReversiPageState extends State<ReversiPage> {
+  final Game _game = Game();
+  SimpleAI _ai = SimpleAI();
+  late FocusNode _mainFocusNode;
+  String _status = '你的回合（黑）';
+  bool _aiThinking = false;
+  int _aiSpeed = 3; // 1 (fastest) .. 5 (slowest)
+  int _aiDifficulty =
+      3; // 1 (easiest) .. 5 (hardest), default 3 = current behaviour
+  // highlight state for AI moves
+  Set<int> _highlightCells = {};
+  Timer? _highlightTimer;
+  bool _highlightVisible = true;
+  int _highlightBlinkCount = 0;
+
+  void _newGame() {
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _game.reset();
+      _status = '你的回合（黑）';
+      _aiThinking = false;
+    });
+  }
+
+  void _onUndo() async {
+    // If AI is thinking, don't allow undo
+    if (_aiThinking) return;
+    bool ok = _game.undoTwoMoves();
+    if (!ok) {
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          content: const Text('無法悔棋（沒有足夠的步數）'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('確認'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    // clear highlights and update status
+    setState(() {
+      _highlightTimer?.cancel();
+      _highlightTimer = null;
+      _highlightCells.clear();
+      _highlightVisible = true;
+      _status = '已悔棋，請下你的棋（黑）';
+      _aiThinking = false;
+    });
+  }
+
+  void _onTapCell(int idx) {
+    if (_aiThinking) return;
+    if (_game.currentPlayer != 1) return; // not human's turn
+    if (!_game.makeMove(idx, 1)) return;
+    _afterHumanMove();
+  }
+
+  void _afterHumanMove() {
+    setState(() {
+      _status = '電腦思考中...';
+      _aiThinking = true;
+    });
+    // small delay to show move; duration controlled by _aiSpeed
+    Future.delayed(_aiDelayDuration(), () {
+      _doAIMoveIfAny();
+    });
+  }
+
+  Future<void> _doAIMoveIfAny() async {
+    if (_game.isGameOver()) {
+      _finishGame();
+      return;
+    }
+    var moves = _game.legalMoves(-1);
+    if (moves.isEmpty) {
+      // AI has no move -> show dialog then back to human
+      await showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          content: const Text('無子可下，請繼續'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('確認'),
+            ),
+          ],
+        ),
+      );
+      setState(() {
+        _game.currentPlayer = 1;
+        _status = '你的回合（黑）';
+        _aiThinking = false;
+      });
+      return;
+    }
+    int aiMove = _ai.chooseMove(_game);
+    if (aiMove >= 0) {
+      // compute flips first so we can highlight them
+      var flipped = _game.flipsForMove(aiMove, -1);
+      _game.makeMove(aiMove, -1);
+      // include the placed piece and flipped pieces
+      _startHighlight({aiMove, ...flipped});
+    }
+    if (_game.isGameOver()) {
+      _finishGame();
+      return;
+    }
+    setState(() {
+      _status = '你的回合（黑）';
+      _aiThinking = false;
+    });
+  }
+
+  void _startHighlight(Set<int> cells) {
+    // cancel previous timer if any
+    _highlightTimer?.cancel();
+    _highlightCells = cells;
+    _highlightVisible = true;
+    _highlightBlinkCount = 0;
+    // blink a few times then clear
+    _highlightTimer = Timer.periodic(const Duration(milliseconds: 300), (t) {
+      setState(() {
+        _highlightVisible = !_highlightVisible;
+      });
+      _highlightBlinkCount++;
+      if (_highlightBlinkCount >= 6) {
+        t.cancel();
+        _highlightTimer = null;
+        setState(() {
+          _highlightCells.clear();
+          _highlightVisible = true;
+        });
+      }
     });
   }
 
   @override
-  Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
-    return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
+  void dispose() {
+    _highlightTimer?.cancel();
+    _mainFocusNode.dispose();
+    super.dispose();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    // ensure AI gets the initial difficulty
+    _ai.difficulty = _aiDifficulty;
+    _mainFocusNode = FocusNode();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _mainFocusNode.requestFocus();
+    });
+  }
+
+  void _finishGame() {
+    var sc = _game.score();
+    String result;
+    if (sc['black']! > sc['white']!)
+      result = '你贏了！';
+    else if (sc['black']! < sc['white']!)
+      result = '電腦贏了';
+    else
+      result = '平手';
+    setState(() {
+      _status = '遊戲結束：$result（黑:${sc['black']} 白:${sc['white']}）';
+      _aiThinking = false;
+    });
+  }
+
+  Widget _buildCell(int idx) {
+    int v = _game.board[idx];
+    Color bg = Colors.green[700]!;
+    Widget content = const SizedBox.shrink();
+    if (v == 1)
+      content = const CircleAvatar(backgroundColor: Colors.black);
+    else if (v == -1)
+      content = const CircleAvatar(backgroundColor: Colors.white);
+
+    bool isLegal = _game.board[idx] == 0 &&
+        _game.flipsForMove(idx, _game.currentPlayer).isNotEmpty &&
+        _game.currentPlayer == 1 &&
+        !_aiThinking;
+
+    return GestureDetector(
+      onTap: () => _onTapCell(idx),
+      child: Container(
+        margin: const EdgeInsets.all(2.0),
+        decoration: BoxDecoration(
+          color: bg,
+          border: Border.all(color: Colors.black),
+        ),
+        child: Stack(
           children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
+            Center(child: SizedBox(width: 34, height: 34, child: content)),
+            if (isLegal)
+              // show legal move indicator at the center of the cell
+              Positioned.fill(
+                child: Center(
+                  child: Container(
+                    width: 14,
+                    height: 14,
+                    decoration: BoxDecoration(
+                      color: Colors.yellow,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.black26),
+                    ),
+                  ),
+                ),
+              ),
+            // highlight overlay for AI changes (smooth fade, red color)
+            if (_highlightCells.contains(idx))
+              Positioned.fill(
+                child: Center(
+                  child: AnimatedOpacity(
+                    opacity: _highlightVisible ? 1.0 : 0.0,
+                    duration: const Duration(milliseconds: 250),
+                    curve: Curves.easeInOut,
+                    child: Container(
+                      width: 44,
+                      height: 44,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.red.withOpacity(0.22),
+                        border: Border.all(color: Colors.redAccent, width: 2.5),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    var sc = _game.score();
+    return Shortcuts(
+      shortcuts: <ShortcutActivator, Intent>{
+        // Ctrl+Z for undo
+        SingleActivator(LogicalKeyboardKey.keyZ, control: true):
+            const UndoIntent(),
+      },
+      child: Actions(
+        actions: <Type, Action<Intent>>{
+          UndoIntent: CallbackAction<UndoIntent>(onInvoke: (intent) {
+            _onUndo();
+            return null;
+          }),
+        },
+        child: Focus(
+          focusNode: _mainFocusNode,
+          autofocus: true,
+          child: Scaffold(
+            appBar: AppBar(
+              title: Text('Reversi 奧賽羅黑白棋 (難度: $_aiDifficulty)'),
+              actions: [
+                IconButton(onPressed: _onUndo, icon: const Icon(Icons.undo)),
+                IconButton(
+                    onPressed: _newGame, icon: const Icon(Icons.refresh)),
+              ],
+            ),
+            body: Padding(
+              padding: const EdgeInsets.all(12.0),
+              child: Column(
+                children: [
+                  Text(_status, style: const TextStyle(fontSize: 16)),
+                  const SizedBox(height: 8),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Chip(label: Text('黑: ${sc['black']}')),
+                      const SizedBox(width: 12),
+                      Chip(label: Text('白: ${sc['white']}')),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: AspectRatio(
+                      aspectRatio: 1,
+                      child: GridView.builder(
+                        itemCount: Game.size * Game.size,
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: Game.size),
+                        itemBuilder: (context, index) => _buildCell(index),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  // 第一行：重新開始、悔棋，置中並支援換行以避免溢出
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 12,
+                    runSpacing: 8,
+                    children: [
+                      ElevatedButton.icon(
+                        onPressed: _newGame,
+                        icon: const Icon(Icons.refresh, size: 18),
+                        label: const Text('重新開始'),
+                        style: ElevatedButton.styleFrom(
+                          elevation: 6,
+                          shadowColor: Colors.black54,
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 10),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                        ),
+                      ),
+                      ElevatedButton.icon(
+                        onPressed: _onUndo,
+                        icon: const Icon(Icons.undo, size: 18),
+                        label: const Text('悔棋'),
+                        style: ElevatedButton.styleFrom(
+                          elevation: 6,
+                          shadowColor: Colors.black54,
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 10),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  // 第二行：速度與難度，置中並支援換行
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 24,
+                    runSpacing: 8,
+                    children: [
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('電腦速度：', style: TextStyle(fontSize: 14)),
+                          const SizedBox(width: 6),
+                          DropdownButton<int>(
+                            value: _aiSpeed,
+                            items: [1, 2, 3, 4, 5]
+                                .map((v) => DropdownMenuItem<int>(
+                                    value: v, child: Text('$v')))
+                                .toList(),
+                            onChanged: (val) {
+                              if (val == null) return;
+                              setState(() {
+                                _aiSpeed = val;
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                      Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('電腦難度：', style: TextStyle(fontSize: 14)),
+                          const SizedBox(width: 6),
+                          DropdownButton<int>(
+                            value: _aiDifficulty,
+                            items: [1, 2, 3, 4, 5]
+                                .map((v) => DropdownMenuItem<int>(
+                                    value: v, child: Text('$v')))
+                                .toList(),
+                            onChanged: (val) {
+                              if (val == null) return;
+                              setState(() {
+                                _aiDifficulty = val;
+                                // apply to AI instance (field assignment)
+                                try {
+                                  _ai.setDifficulty(val);
+                                } catch (e) {
+                                  // fallback: if method not present, ignore
+                                }
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  const Text('提示：黃色圓點表示可下的位置（僅在人類回合顯示）',
+                      style: TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
+          ),
+        ),
       ),
     );
+  }
+
+  Duration _aiDelayDuration() {
+    // Map speed level to milliseconds. 1 = fastest, 5 = slowest
+    switch (_aiSpeed) {
+      case 1:
+        return const Duration(milliseconds: 100);
+      case 2:
+        return const Duration(milliseconds: 500);
+      case 3:
+        return const Duration(milliseconds: 1000);
+      case 4:
+        return const Duration(milliseconds: 3000);
+      case 5:
+        return const Duration(milliseconds: 5000);
+      default:
+        return const Duration(milliseconds: 500);
+    }
   }
 }
